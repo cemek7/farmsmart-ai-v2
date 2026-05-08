@@ -1,4 +1,5 @@
 import asyncio
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -13,13 +14,23 @@ router = APIRouter(prefix="/income", tags=["income"])
 
 
 def _background_retrain(user_id: int) -> None:
-    """Trigger retraining in a thread pool to avoid blocking the event loop."""
+    """Run in executor — sync, catches all exceptions so it never crashes the request."""
     from app.ml.train_models import maybe_retrain_user
     try:
         maybe_retrain_user(user_id)
     except Exception as exc:
-        # Log but don't crash the request
         print(f"[ML] Retrain failed for user {user_id}: {exc}")
+
+
+async def _validate_expense_id(expense_id: Optional[int], user_id: int, db: AsyncSession) -> Optional[int]:
+    """Silently drops expense_id that doesn't belong to the current user."""
+    if expense_id is None:
+        return None
+    from app.models.expense import Expense
+    exp = await db.get(Expense, expense_id)
+    if exp is None or exp.user_id != user_id:
+        return None
+    return expense_id
 
 
 @router.get("", response_model=list[IncomeRead])
@@ -28,9 +39,7 @@ async def list_income(
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(
-        select(Income)
-        .where(Income.user_id == current_user.id)
-        .order_by(Income.date.desc())
+        select(Income).where(Income.user_id == current_user.id).order_by(Income.date.desc())
     )
     return result.scalars().all()
 
@@ -41,15 +50,13 @@ async def create_income(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    income = Income(user_id=current_user.id, **payload.model_dump())
+    data = payload.model_dump()
+    data["expense_id"] = await _validate_expense_id(data.get("expense_id"), current_user.id, db)
+    income = Income(user_id=current_user.id, **data)
     db.add(income)
     await db.commit()
     await db.refresh(income)
-
-    # Fire-and-forget retraining in thread pool
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _background_retrain, current_user.id)
-
+    asyncio.get_running_loop().run_in_executor(None, _background_retrain, current_user.id)
     return income
 
 
@@ -70,14 +77,14 @@ async def update_income(
     db: AsyncSession = Depends(get_db),
 ):
     income = await _get_owned_income(income_id, current_user.id, db)
-    for field, value in payload.model_dump(exclude_unset=True).items():
+    update_data = payload.model_dump(exclude_unset=True)
+    if "expense_id" in update_data:
+        update_data["expense_id"] = await _validate_expense_id(update_data["expense_id"], current_user.id, db)
+    for field, value in update_data.items():
         setattr(income, field, value)
     await db.commit()
     await db.refresh(income)
-
-    loop = asyncio.get_event_loop()
-    loop.run_in_executor(None, _background_retrain, current_user.id)
-
+    asyncio.get_running_loop().run_in_executor(None, _background_retrain, current_user.id)
     return income
 
 

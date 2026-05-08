@@ -55,4 +55,4 @@ async def test_get_me(client: AsyncClient):
 
 async def test_get_me_no_token(client: AsyncClient):
     response = await client.get("/auth/me")
-    assert response.status_code == 403
+    assert response.status_code == 401

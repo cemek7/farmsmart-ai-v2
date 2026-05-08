@@ -1,49 +1,57 @@
-import asyncio
+import os
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 
-from app.main import app
-from app.database import Base, get_db
-
-# Use in-memory SQLite for tests (shared across the whole session for speed)
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
-test_engine = create_async_engine(TEST_DATABASE_URL, connect_args={"check_same_thread": False})
-TestSessionLocal = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
+
+async def register_user(client: AsyncClient, email: str, password: str = "Password1!", name: str = "Test Farmer") -> str:
+    """Register a user and return their JWT access token."""
+    resp = await client.post("/auth/register", json={"name": name, "email": email, "password": password})
+    assert resp.status_code == 201, resp.text
+    return resp.json()["access_token"]
 
 
-async def override_get_db():
-    async with TestSessionLocal() as session:
-        try:
-            yield session
-        finally:
-            await session.close()
+def auth(token: str) -> dict:
+    return {"Authorization": f"Bearer {token}"}
 
 
-app.dependency_overrides[get_db] = override_get_db
-
-
-@pytest.fixture(scope="session")
-def event_loop():
-    """Provide a session-scoped event loop for all async tests."""
-    policy = asyncio.get_event_loop_policy()
-    loop = policy.new_event_loop()
-    yield loop
-    loop.close()
-
-
-@pytest_asyncio.fixture(scope="session", autouse=True)
-async def create_tables():
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+@pytest.fixture(scope="session", autouse=True)
+def ensure_baseline_model():
+    """Train baseline model once per test session if it doesn't exist yet."""
+    from app.ml.train_models import MODELS_DIR, train_baseline
+    if not os.path.exists(os.path.join(MODELS_DIR, "baseline.joblib")):
+        train_baseline()
 
 
 @pytest_asyncio.fixture
 async def client():
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    """Fresh in-memory SQLite DB per test — full isolation, no cleanup needed."""
+    from app.main import app as fastapi_app
+    from app.database import Base, get_db
+    import app.models  # noqa — registers all models with Base
+
+    engine = create_async_engine(TEST_DATABASE_URL)
+    session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    async def _override():
+        async with session_factory() as session:
+            try:
+                yield session
+            finally:
+                await session.close()
+
+    fastapi_app.dependency_overrides[get_db] = _override
+
+    async with AsyncClient(transport=ASGITransport(app=fastapi_app), base_url="http://test") as ac:
         yield ac
+
+    fastapi_app.dependency_overrides.pop(get_db, None)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    await engine.dispose()

@@ -8,9 +8,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_DAYS: int = 7
     APP_ENV: str = "development"
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
 @lru_cache()
